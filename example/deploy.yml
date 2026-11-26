@@ -1,0 +1,68 @@
+# Manual deploy (Actions → Deploy → Run workflow; works from the GitHub mobile app too).
+#
+# Runs on a self-hosted runner: the server's port 22 is closed to the internet and only reachable through Google
+# Cloud Identity-Aware Proxy (IAP), with the runner machine's gcloud session. The deploy key lives only on the runner,
+# not in GitHub secrets.
+#
+# Repository variables (Settings → Secrets and variables → Actions → Variables):
+#   GCP_PROJECT, GCP_ZONE, GCP_INSTANCE   the VM
+#   DEPLOY_KEY_PATH                       private key on the runner (e.g. ~/.secrets/app/deploy_key)
+# Secrets:
+#   VM_HOST         name the VM's host key is pinned under in known_hosts (the connection itself goes through the tunnel)
+#   VM_USER         SSH user
+#   VM_KNOWN_HOSTS  output of `ssh-keyscan <host>`: no trust-on-first-use, a swapped server is refused
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # a second deploy waits for the first, it never interrupts it
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 15
+    steps:
+      # Build here, not on the server: on a 1 GB VM the build took ~9 minutes and starved the web server.
+      - uses: actions/checkout@v4
+        with:
+          clean: false   # keep vendor/ and node_modules/ between runs on our own runner
+
+      - name: Build the frontend
+        run: |
+          composer install --no-scripts --no-progress --no-interaction   # Vite imports a helper from vendor/
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          rm -rf public/build
+          npm run build
+          COPYFILE_DISABLE=1 tar czf "$RUNNER_TEMP/build.tgz" -C public/build .   # no macOS ._ files
+          echo "build $(du -h "$RUNNER_TEMP/build.tgz" | cut -f1) · $GITHUB_SHA"
+
+      - name: Ship it
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_ZONE: ${{ vars.GCP_ZONE }}
+          GCP_INSTANCE: ${{ vars.GCP_INSTANCE }}
+          DEPLOY_KEY_PATH: ${{ vars.DEPLOY_KEY_PATH }}
+        run: |
+          key="${DEPLOY_KEY_PATH/#\~/$HOME}"
+          [ -r "$key" ] || { echo "::error::deploy key not found on this runner: $key"; exit 1; }
+          for name in VM_HOST VM_USER VM_KNOWN_HOSTS GCP_PROJECT GCP_ZONE GCP_INSTANCE; do
+            [ -n "${!name}" ] || { echo "::error::missing $name"; missing=1; }
+          done
+          [ -z "${missing:-}" ] || exit 1
+
+          dir="$(mktemp -d "$RUNNER_TEMP/deploy.XXXXXX")"
+          trap 'rm -rf "$dir"' EXIT
+          printf '%s\n' "$VM_KNOWN_HOSTS" > "$dir/known_hosts"
+
+          # -F /dev/null + IdentityAgent=none: only this key, ignoring the runner user's ~/.ssh/config and agent.
+          # The build travels on stdin of the same connection that runs the deploy: one round trip, nothing to clean up.
+          ssh -F /dev/null -i "$key" -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes \
+            -o ProxyCommand="gcloud compute start-iap-tunnel $GCP_INSTANCE 22 --listen-on-stdin --project=$GCP_PROJECT --zone=$GCP_ZONE --verbosity=warning" \
+            -o UserKnownHostsFile="$dir/known_hosts" -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" "deploy-build $GITHUB_SHA" < "$RUNNER_TEMP/build.tgz"

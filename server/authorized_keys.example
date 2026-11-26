@@ -1,0 +1,9 @@
+# ~deploy/.ssh/authorized_keys on the server: ONE line for the CI deploy key.
+#
+# command=          whatever the client asks for, this script runs instead (the request arrives in $SSH_ORIGINAL_COMMAND)
+# restrict          no port/agent/X11 forwarding, no PTY, no ~/.ssh/rc (OpenSSH ≥ 7.2)
+# from=             optional: only from the IAP range (35.235.240.0/20) when the firewall already limits port 22 to it
+#
+# Even with the private key, an attacker can only deploy a commit that is already on the deploy branch.
+
+restrict,from="35.235.240.0/20",command="bash /var/www/app/scripts/deploy.sh" ssh-ed25519 AAAA…replace-with-the-public-key… ci-deploy
